@@ -174,18 +174,21 @@ foreach ($rp in $runPairs) {
   $csvSha = Get-FileSha256 -Path $dstCsv
   $uid = $csvSha.Substring(0, 16)
 
+  $srcJsonShown = ""
+  if (Test-Path $srcJson) { $srcJsonShown = $srcJson }
+
   $line = "{0},{1:D4},{2},{3},{4:D4},{5},{6},{7},{8},{9}" -f `
     (Get-Date -Format "o"), `
     ([int]$rp.RunId), `
     ($srcCsv -replace ",",";"), `
-    ((if (Test-Path $srcJson) { $srcJson } else { "" }) -replace ",",";"), `
+    ($srcJsonShown -replace ",",";"), `
     ([int]$dstRunId), `
     ($dstCsv -replace ",",";"), `
     ($dstJsonShown -replace ",",";"), `
     $uid, `
     $csvSha, `
     $jsonSha
-
+    
   Add-Content -Path $manifestPath -Value $line
   Write-Host ("Copied RUN{0:D4} -> RUN{1:D4}  uid={2}" -f $rp.RunId, $dstRunId, $uid)
 }

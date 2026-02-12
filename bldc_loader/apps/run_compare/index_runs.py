@@ -11,8 +11,10 @@ Assumptions:
 Adds:
 - run_uid derived from SHA256(csv bytes) (first 16 chars for display)
 - csv_sha256 full digest
-- voltage/current summary fields (if present)
-- kV estimate from rpm/volts (median + p10/p90)
+- voltage/current summary fields (vin_v / iin_a supported)
+- kV estimates geared for NO-LOAD (factory-ish):
+    * kv_top_*: median(rpm/v) on the top-RPM slice (closest to steady no-load)
+    * kv_fit  : regression-corrected using V ≈ a*RPM + b*I + c => kV=1/a (cross-check)
 
 Usage:
   python index_runs.py --runs-dir "C:/path/to/SD_dump" --out "bldc_loader/data/runs_index.csv"
@@ -34,23 +36,8 @@ import pandas as pd
 
 RUN_RE = re.compile(r"^RUN(\d{4})\.CSV$", re.IGNORECASE)
 
-# Column candidates (expand as your schema evolves)
-VOLT_COL_CANDIDATES = [
-    "vin_v",
-    "vbat_v",
-    "vbatt_v",
-    "vbus_v",
-    "volts",
-    "voltage_v",
-    "pack_v",
-]
-CURR_COL_CANDIDATES = [
-    "iin_a",
-    "ibat_a",
-    "current_a",
-    "amps",
-    "current",
-]
+VOLT_COL_CANDIDATES = ["vin_v", "vbat_v", "vbatt_v", "vbus_v", "volts", "voltage_v", "pack_v"]
+CURR_COL_CANDIDATES = ["iin_a", "ibat_a", "current_a", "amps", "current"]
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -98,11 +85,9 @@ def repair_json_text(txt: str) -> str:
 def try_load_json(json_path: Path) -> Tuple[str, Dict[str, Any]]:
     if not json_path.exists():
         return "none", {}
-
     txt = json_path.read_text(encoding="utf-8", errors="replace")
     if not txt.strip():
         return "invalid", {}
-
     try:
         return "ok", json.loads(txt)
     except Exception:
@@ -167,7 +152,7 @@ def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> Optional[str
     return None
 
 
-def compute_electrical_and_kv(df: pd.DataFrame) -> Dict[str, Optional[float] | str]:
+def compute_voltage_current_summary(df: pd.DataFrame) -> Dict[str, Optional[float] | str]:
     out: Dict[str, Optional[float] | str] = {
         "volt_col": "",
         "curr_col": "",
@@ -176,9 +161,6 @@ def compute_electrical_and_kv(df: pd.DataFrame) -> Dict[str, Optional[float] | s
         "v_max": None,
         "i_mean": None,
         "i_max": None,
-        "kv_median": None,
-        "kv_p10": None,
-        "kv_p90": None,
     }
 
     vcol = pick_first_existing(df, VOLT_COL_CANDIDATES)
@@ -201,17 +183,99 @@ def compute_electrical_and_kv(df: pd.DataFrame) -> Dict[str, Optional[float] | s
             out["i_mean"] = float(np.mean(i))
             out["i_max"] = float(np.max(i))
 
-    # kV estimate requires rpm + volts
-    if vcol and "rpm" in df.columns:
-        v = df[vcol].to_numpy(dtype=float)
-        r = df["rpm"].to_numpy(dtype=float)
+    return out
 
-        m = np.isfinite(v) & np.isfinite(r) & (v > 1.0) & (r > 0)
-        if np.any(m):
-            kv = r[m] / v[m]
-            out["kv_median"] = float(np.median(kv))
-            out["kv_p10"] = float(np.percentile(kv, 10))
-            out["kv_p90"] = float(np.percentile(kv, 90))
+
+def compute_kv_estimates_no_load(df: pd.DataFrame, vcol: str, icol: str) -> Dict[str, Optional[float]]:
+    """
+    NO-LOAD / factory-ish estimates.
+
+    kv_top_*:
+      Use the top-RPM slice (top 20% of RPM values, after RPM>3000) and compute rpm/v.
+      This approximates stabilized no-load RPM/Volt.
+
+    kv_fit:
+      Regression cross-check using V ≈ a*RPM + b*I + c => kV=1/a
+
+    Returns keys:
+      kv_top_median, kv_top_p10, kv_top_p90
+      kv_fit, r_fit_ohm, v0_fit_v, kv_fit_r2
+    """
+    out: Dict[str, Optional[float]] = {
+        "kv_top_median": None,
+        "kv_top_p10": None,
+        "kv_top_p90": None,
+        "kv_fit": None,
+        "r_fit_ohm": None,
+        "v0_fit_v": None,
+        "kv_fit_r2": None,
+    }
+
+    if "rpm" not in df.columns or vcol not in df.columns:
+        return out
+
+    rpm = df["rpm"].to_numpy(dtype=float)
+    v = df[vcol].to_numpy(dtype=float)
+
+    have_i = bool(icol) and (icol in df.columns)
+    i = df[icol].to_numpy(dtype=float) if have_i else None
+
+    m = np.isfinite(rpm) & np.isfinite(v) & (rpm > 0) & (v > 1.0)
+    if have_i:
+        m = m & np.isfinite(i)
+
+    if not np.any(m):
+        return out
+
+    rpm_m = rpm[m]
+    v_m = v[m]
+    i_m = i[m] if have_i else None
+
+    # drop invalid tach sentinel and startup region
+    m2 = rpm_m >= 3000.0
+    rpm_m = rpm_m[m2]
+    v_m = v_m[m2]
+    i_m = i_m[m2] if have_i else None
+
+    if rpm_m.size < 30:
+        return out
+
+    # --- kv_top_*: top 20% RPM slice ---
+    r_thr = float(np.percentile(rpm_m, 80.0))
+    mt = rpm_m >= r_thr
+    if np.count_nonzero(mt) >= 10:
+        kv = rpm_m[mt] / v_m[mt]
+        kv = kv[np.isfinite(kv)]
+        if kv.size:
+            out["kv_top_median"] = float(np.median(kv))
+            out["kv_top_p10"] = float(np.percentile(kv, 10))
+            out["kv_top_p90"] = float(np.percentile(kv, 90))
+
+    # --- kv_fit: regression correction (cross-check) ---
+    if have_i and i_m is not None and rpm_m.size >= 50:
+        # avoid rare spikes dominating fit
+        i_hi = float(np.percentile(i_m, 95.0))
+        mf = i_m <= i_hi
+
+        rpm_f = rpm_m[mf]
+        v_f = v_m[mf]
+        i_f = i_m[mf]
+
+        if rpm_f.size >= 30:
+            X = np.column_stack([rpm_f, i_f, np.ones_like(rpm_f)])
+            y = v_f
+            beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+            a, b, c = float(beta[0]), float(beta[1]), float(beta[2])
+
+            if a > 0:
+                out["kv_fit"] = float(1.0 / a)
+                out["r_fit_ohm"] = float(b)
+                out["v0_fit_v"] = float(c)
+
+                yhat = X @ beta
+                ss_res = float(np.sum((y - yhat) ** 2))
+                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                out["kv_fit_r2"] = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else None
 
     return out
 
@@ -224,7 +288,6 @@ def build_index_for_run(csv_path: Path) -> Dict[str, Any]:
 
     json_path = csv_path.with_suffix(".JSON")
 
-    # UID from CSV bytes
     csv_sha256 = sha256_file(csv_path)
     run_uid = csv_sha256[:16]
 
@@ -264,7 +327,7 @@ def build_index_for_run(csv_path: Path) -> Dict[str, Any]:
     if rpm_col in df.columns:
         r = df[rpm_col].to_numpy(dtype=float)
         r = r[np.isfinite(r)]
-        r = r[r >= 0]  # drop invalid -1
+        r = r[r >= 0]
         if r.size:
             rpm_mean = float(np.mean(r))
             rpm_max = float(np.max(r))
@@ -284,7 +347,17 @@ def build_index_for_run(csv_path: Path) -> Dict[str, Any]:
     log_hz_declared = safe_float(meta.get("log_hz"))
     sample_hz = safe_float(meta.get("sample_hz"))
 
-    elec = compute_electrical_and_kv(df)
+    vc = compute_voltage_current_summary(df)
+    vcol = str(vc["volt_col"] or "")
+    icol = str(vc["curr_col"] or "")
+
+    kvs = compute_kv_estimates_no_load(df, vcol=vcol, icol=icol) if vcol else {
+        "kv_top_median": None, "kv_top_p10": None, "kv_top_p90": None,
+        "kv_fit": None, "r_fit_ohm": None, "v0_fit_v": None, "kv_fit_r2": None
+    }
+
+    # "factory-like" preferred kV
+    kv_factory = kvs["kv_top_median"] if kvs["kv_top_median"] is not None else kvs["kv_fit"]
 
     return {
         "run_id": run_id,
@@ -313,16 +386,21 @@ def build_index_for_run(csv_path: Path) -> Dict[str, Any]:
         "rpm_max": rpm_max,
         "thr_mean": thr_mean,
         "thr_max": thr_max,
-        "volt_col": elec["volt_col"],
-        "curr_col": elec["curr_col"],
-        "v_mean": elec["v_mean"],
-        "v_min": elec["v_min"],
-        "v_max": elec["v_max"],
-        "i_mean": elec["i_mean"],
-        "i_max": elec["i_max"],
-        "kv_median": elec["kv_median"],
-        "kv_p10": elec["kv_p10"],
-        "kv_p90": elec["kv_p90"],
+        "volt_col": vcol,
+        "curr_col": icol,
+        "v_mean": vc["v_mean"],
+        "v_min": vc["v_min"],
+        "v_max": vc["v_max"],
+        "i_mean": vc["i_mean"],
+        "i_max": vc["i_max"],
+        "kv_factory": kv_factory,
+        "kv_top_median": kvs["kv_top_median"],
+        "kv_top_p10": kvs["kv_top_p10"],
+        "kv_top_p90": kvs["kv_top_p90"],
+        "kv_fit": kvs["kv_fit"],
+        "r_fit_ohm": kvs["r_fit_ohm"],
+        "v0_fit_v": kvs["v0_fit_v"],
+        "kv_fit_r2": kvs["kv_fit_r2"],
         "columns": ",".join(cols),
     }
 

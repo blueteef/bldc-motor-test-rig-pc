@@ -90,12 +90,15 @@ def scatter_plot(df_a, df_b, x_col: str, y_col: str, name_a: str, name_b: str, t
 
 
 def fmt(x, nd=2):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
     try:
-        return f"{float(x):.{nd}f}"
+        if x is None:
+            return "—"
+        x = float(x)
+        if np.isnan(x):
+            return "—"
+        return f"{x:.{nd}f}"
     except Exception:
-        return str(x)
+        return "—"
 
 
 st.title("BLDC Run Compare")
@@ -103,7 +106,6 @@ st.title("BLDC Run Compare")
 with st.sidebar:
     st.header("Paths")
     index_path_txt = st.text_input("Index file", value="bldc_loader/data/runs_index.csv")
-    runs_dir_txt = st.text_input("Runs folder filter (optional; prefix match)", value="")
     st.divider()
     st.caption("Debug")
     st.write("CWD:", os.getcwd())
@@ -114,10 +116,6 @@ if not ip.exists():
     st.stop()
 
 dfi = load_index(ip)
-
-if runs_dir_txt.strip():
-    rd = str(Path(runs_dir_txt).expanduser().resolve())
-    dfi = dfi[dfi["csv_path"].astype(str).str.startswith(rd)]
 
 st.subheader("Run library")
 
@@ -137,7 +135,9 @@ with col3:
             "motor_id",
             "fw",
             "duration_s",
-            "kv_median",
+            "kv_factory",
+            "kv_top_median",
+            "kv_fit",
             "v_mean",
             "i_mean",
             "vib_rms_mean",
@@ -152,7 +152,9 @@ with col3:
             "motor_id",
             "fw",
             "duration_s",
-            "kv_median",
+            "kv_factory",
+            "kv_top_median",
+            "kv_fit",
             "v_mean",
             "i_mean",
             "vib_rms_mean",
@@ -188,7 +190,6 @@ row_b = dfi[dfi["run_id"] == b_id].iloc[0]
 name_a = f"RUN{a_id} ({row_a.get('motor_id','')})"
 name_b = f"RUN{b_id} ({row_b.get('motor_id','')})"
 
-# Prominent identifiers + metrics
 st.markdown("### Key identifiers")
 id1, id2 = st.columns(2)
 with id1:
@@ -198,16 +199,19 @@ with id2:
 
 st.markdown("### Key metrics")
 m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("kV (A)", fmt(row_a.get("kv_median"), 0), help=f"Median(rpm/volts). p10–p90: {fmt(row_a.get('kv_p10'),0)}–{fmt(row_a.get('kv_p90'),0)}")
-m2.metric("kV (B)", fmt(row_b.get("kv_median"), 0), help=f"Median(rpm/volts). p10–p90: {fmt(row_b.get('kv_p10'),0)}–{fmt(row_b.get('kv_p90'),0)}")
+
+m1.metric("kV Factory (A)", fmt(row_a.get("kv_factory"), 0),
+          help=f"Top-RPM median(rpm/V). top p10–p90: {fmt(row_a.get('kv_top_p10'),0)}–{fmt(row_a.get('kv_top_p90'),0)}")
+m2.metric("kV Factory (B)", fmt(row_b.get("kv_factory"), 0),
+          help=f"Top-RPM median(rpm/V). top p10–p90: {fmt(row_b.get('kv_top_p10'),0)}–{fmt(row_b.get('kv_top_p90'),0)}")
 m3.metric("Volts mean (A)", fmt(row_a.get("v_mean"), 2))
 m4.metric("Volts mean (B)", fmt(row_b.get("v_mean"), 2))
 m5.metric("Amps mean (A)", fmt(row_a.get("i_mean"), 2))
 m6.metric("Amps mean (B)", fmt(row_b.get("i_mean"), 2))
 
 st.caption(
-    f"Voltage column: A={row_a.get('volt_col','') or '—'} | B={row_b.get('volt_col','') or '—'}    •    "
-    f"Current column: A={row_a.get('curr_col','') or '—'} | B={row_b.get('curr_col','') or '—'}"
+    f"Cross-check fit kV: A={fmt(row_a.get('kv_fit'),0)} (R²={fmt(row_a.get('kv_fit_r2'),3)}) | "
+    f"B={fmt(row_b.get('kv_fit'),0)} (R²={fmt(row_b.get('kv_fit_r2'),3)})"
 )
 
 # Load full data
@@ -216,14 +220,13 @@ csv_b = str(row_b["csv_path"])
 df_a = prep_run_df(read_run_csv(csv_a))
 df_b = prep_run_df(read_run_csv(csv_b))
 
-# Summary table
 st.markdown("### Summary (A vs B)")
 summary_keys = [
     "run_uid", "csv_sha256",
     "motor_id", "fw", "git_sha", "build_utc",
     "n_rows", "duration_s",
     "log_hz_declared", "fs_hz_est", "dt_med_ms", "dt_std_ms",
-    "kv_median", "kv_p10", "kv_p90",
+    "kv_factory", "kv_top_median", "kv_fit", "r_fit_ohm", "v0_fit_v", "kv_fit_r2",
     "v_mean", "v_min", "v_max",
     "i_mean", "i_max",
     "vib_rms_mean", "vib_rms_max",
@@ -233,7 +236,6 @@ summary_keys = [
 summary = pd.DataFrame([{"metric": k, "A": row_a.get(k, ""), "B": row_b.get(k, "")} for k in summary_keys])
 st.dataframe(summary, use_container_width=True, height=460)
 
-# Plots
 st.markdown("### Plots")
 p1, p2 = st.columns(2)
 with p1:
@@ -259,7 +261,7 @@ with p4:
         use_container_width=True,
     )
 
-# Voltage/current plots (supports differing column names between runs)
+# Voltage/current vs time (uses each run's own column names)
 vcol_a = str(row_a.get("volt_col", "") or "")
 vcol_b = str(row_b.get("volt_col", "") or "")
 icol_a = str(row_a.get("curr_col", "") or "")
@@ -273,7 +275,7 @@ with p5:
     if vcol_b and vcol_b in df_b.columns:
         fig.add_trace(go.Scatter(x=df_b["t_s"], y=df_b[vcol_b], mode="lines", name=f"{name_b} ({vcol_b})"))
     if len(fig.data) == 0:
-        st.info("No voltage column found in either run (configure VOLT_COL_CANDIDATES in index_runs.py).")
+        st.info("No voltage column found in either run.")
     else:
         fig.update_layout(title="Voltage vs Time", xaxis_title="Time (s)", yaxis_title="Volts", height=320,
                           margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
@@ -286,7 +288,7 @@ with p6:
     if icol_b and icol_b in df_b.columns:
         fig.add_trace(go.Scatter(x=df_b["t_s"], y=df_b[icol_b], mode="lines", name=f"{name_b} ({icol_b})"))
     if len(fig.data) == 0:
-        st.info("No current column found in either run (configure CURR_COL_CANDIDATES in index_runs.py).")
+        st.info("No current column found in either run.")
     else:
         fig.update_layout(title="Current vs Time", xaxis_title="Time (s)", yaxis_title="Amps", height=320,
                           margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
