@@ -1,0 +1,13 @@
+# venv
+.venv/
+
+# python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# generated data
+data/
+**/_qa/
+
+SD_dump/

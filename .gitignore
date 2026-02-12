@@ -1,14 +1,8 @@
-# Python
+.venv/
 __pycache__/
+**/__pycache__/
 *.pyc
-
-# Virtual env
-venv/
-
-# Data
-SD_dump/
-*.parquet
-*.meta.json
-
-# Jupyter
 .ipynb_checkpoints/
+SD_dump/
+bldc_loader/data/
+**/_qa/
